@@ -1,0 +1,957 @@
+import assert from "node:assert/strict";
+import { X509Certificate } from "node:crypto";
+import { createServer } from "node:net";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+import WebSocket from "ws";
+import { generate } from "selfsigned";
+import { CodexRelayClient, RELAY_SNAPSHOT_STALE_MS, resolveRelayHealth } from "../src/codex-relay-client.js";
+import { isAllowedRelayHost, isPrivateLanHost, privateLanAddresses } from "../src/relay-network.js";
+import {
+  CodexRelayServer, readRelayServerConfig, relayDiscoveryTxt,
+  relaySnapshotFailureShouldDegrade, validateRelayServerConfig
+} from "../src/codex-relay-server.js";
+import {
+  HostActivityIndex, RELAY_PROTOCOL_VERSION, normalizeHostSnapshotAtReceipt,
+  parseRelayCommand, type HostSnapshot
+} from "../src/relay-protocol.js";
+import type { CodexHost, MicroSnapshot } from "../src/types.js";
+
+const host: CodexHost = { hostId: "56fd97ad-7073-42cc-85ce-befa17546d7c", hostName: "Test Mac", platform: "darwin" };
+const snapshot: MicroSnapshot = {
+  slots: Array.from({ length: 6 }, (_, id) => ({
+    id, threadKey: `00000000-0000-4000-8000-00000000000${id}`, title: `Task ${id + 1}`,
+    status: id === 0 ? "working" : "idle", selected: id === 0, activityAt: 1_000 - id
+  })),
+  layout: {
+    version: 1,
+    slots: {
+      ACT06: { keycapId: "FAST" }, ACT07: { keycapId: "APPR" }, ACT08: { keycapId: "REJ" },
+      ACT09: { keycapId: "SPLIT" }, ACT10_ACT11: { keycapId: "CODEX" }, ACT12: { keycapId: "CODEX" }
+    },
+    analogStick: { up: {}, right: {}, down: {}, left: {} }
+  },
+  agentSource: "recent",
+  lightingAutoOff: "3-minutes",
+  theme: "dark"
+};
+
+test("relay refuses wildcard exposure and short authentication tokens", () => {
+  assert.throws(() => validateRelayServerConfig({ enabled: true, listenHost: "0.0.0.0", port: 47_651, token: "x".repeat(32) }), /loopback or a specific Tailscale address/);
+  assert.throws(() => validateRelayServerConfig({ enabled: true, listenHost: "203.0.113.10", port: 47_651, token: "x".repeat(32) }), /loopback or a specific Tailscale/);
+  assert.throws(() => validateRelayServerConfig({ enabled: true, listenHost: "127.0.0.1", port: 47_651, token: "short" }), /32 bytes/);
+  assert.equal(isAllowedRelayHost("100.64.0.42"), true);
+  assert.equal(isAllowedRelayHost("example.tailnet.ts.net"), true);
+  assert.equal(isAllowedRelayHost("8.8.8.8"), false);
+});
+
+test("nearby relay accepts only pinned TLS on a private address and never advertises its token", async () => {
+  const certificate = await generate([{ name: "commonName", value: "Codex Deck test" }], {
+    keyType: "ec", curve: "P-256", algorithm: "sha256"
+  });
+  const fingerprint = new X509Certificate(certificate.cert).fingerprint256
+    .replaceAll(":", "").toLowerCase();
+  const local = {
+    enabled: true,
+    listenHost: "auto",
+    port: 47_653,
+    token: "secret".repeat(8),
+    transport: "local" as const,
+    tls: {
+      certificate: certificate.cert,
+      privateKey: certificate.private,
+      fingerprintSha256: fingerprint
+    },
+    discovery: { enabled: true }
+  };
+  validateRelayServerConfig(local);
+  const txt = relayDiscoveryTxt(local, host, "192.168.1.25");
+  assert.equal(txt.hostId, host.hostId);
+  assert.equal(txt.address, "192.168.1.25");
+  assert.equal(txt.fingerprint, fingerprint);
+  assert.equal(JSON.stringify(txt).includes(local.token), false);
+  assert.equal("token" in txt, false);
+  assert.throws(
+    () => validateRelayServerConfig({ ...local, tls: undefined }), /requires pinned TLS/);
+  assert.throws(
+    () => validateRelayServerConfig({ ...local, listenHost: "203.0.113.8" }), /secure auto local mode/);
+  assert.equal(isPrivateLanHost("10.0.0.4"), true);
+  assert.equal(isPrivateLanHost("172.31.9.2"), true);
+  assert.equal(isPrivateLanHost("192.168.50.9"), true);
+  assert.equal(isPrivateLanHost("100.100.100.100"), false);
+  assert.equal(isPrivateLanHost("8.8.8.8"), false);
+  assert.deepEqual(privateLanAddresses({
+    en0: [
+      { address: "192.168.1.25", netmask: "255.255.255.0", family: "IPv4", mac: "aa", internal: false, cidr: "192.168.1.25/24" },
+      { address: "fe80::1", netmask: "ffff::", family: "IPv6", mac: "aa", internal: false, cidr: "fe80::1/64", scopeid: 1 }
+    ],
+    vpn: [{ address: "100.100.100.100", netmask: "255.192.0.0", family: "IPv4", mac: "bb", internal: false, cidr: "100.100.100.100/10" }]
+  }), ["192.168.1.25"]);
+});
+
+test("optional mobile relay config is absent-safe and validates before startup", async () => {
+  const root = await mkdtemp(join(tmpdir(), "codex-mobile-relay-"));
+  try {
+    const path = join(root, "mobile-relay-server.json");
+    assert.equal(await readRelayServerConfig(path), null);
+    await writeFile(path, JSON.stringify({ enabled: true, listenHost: "127.0.0.1", port: 47_652, token: "m".repeat(32) }));
+    assert.deepEqual(await readRelayServerConfig(path), {
+      enabled: true, listenHost: "127.0.0.1", port: 47_652, token: "m".repeat(32)
+    });
+    await writeFile(path, JSON.stringify({ enabled: true, listenHost: "0.0.0.0", port: 47_652, token: "m".repeat(32) }));
+    await assert.rejects(readRelayServerConfig(path), /loopback or a specific Tailscale address/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("relay command parser permits only the narrow native command surface", () => {
+  const threadKey = "00000000-0000-4000-8000-000000000005";
+  assert.deepEqual(parseRelayCommand({ kind: "agent", slot: 5, threadKey, act: 1 }), { kind: "agent", slot: 5, threadKey, act: 1 });
+  assert.deepEqual(parseRelayCommand({ kind: "reasoning", direction: "increase" }), { kind: "reasoning", direction: "increase" });
+  assert.deepEqual(parseRelayCommand({ kind: "rate-limit-reset" }), { kind: "rate-limit-reset" });
+  assert.equal(parseRelayCommand({ kind: "agent", slot: 6, threadKey, act: 1 }), null);
+  assert.equal(parseRelayCommand({ kind: "evaluate", expression: "process.exit()" }), null);
+  assert.equal(parseRelayCommand({ kind: "keycap", keycapId: "NOT_REAL" }), null);
+  assert.notEqual(parseRelayCommand({ kind: "agent", slot: 1, threadKey: "local:019f6de7-44c2-7fe2-9d17-9322c952e626", act: 1 }), null);
+  assert.notEqual(parseRelayCommand({ kind: "agent", slot: 0, threadKey: "client-new-thread:e3c18619-71ff-4a8d-8dd3-d475e9bcf162", act: 1 }), null);
+  assert.notEqual(parseRelayCommand({ kind: "agent", slot: 0, threadKey: "local:client-new-thread:e3c18619-71ff-4a8d-8dd3-d475e9bcf162", act: 1 }), null);
+  assert.equal(parseRelayCommand({ kind: "agent", slot: 1, threadKey: "local:../../secret", act: 1 }), null);
+});
+
+test("relay snapshot parser bounds and validates host session catalogs", async () => {
+  const { parseRelayServerMessage } = await import("../src/relay-protocol.js");
+  const valid = { type: "snapshot", protocol: 1, host, observedAt: 1, snapshot: structuredClone(snapshot) };
+  valid.snapshot.hostSessions = [{ threadId: "00000000-0000-4000-8000-000000000000", activityAt: 1, status: "working", completionRevision: 42 }];
+  valid.snapshot.hostSessions[0]!.contextUsedPercent = 56;
+  valid.snapshot.slots[0]!.contextUsedPercent = 56;
+  assert.notEqual(parseRelayServerMessage(valid), null);
+  valid.snapshot.activeThreadKey = "local:00000000-0000-4000-8000-000000000000";
+  valid.snapshot.activeThreadTitle = "Build the iPhone companion";
+  assert.notEqual(parseRelayServerMessage(valid), null);
+  valid.snapshot.usage = {
+    windows: [{ id: "weekly", kind: "weekly", usedPercent: 35, remainingPercent: 65, windowDurationMins: 10_080, resetsAt: 1_800_000_000_000 }],
+    observedAt: 1_700_000_000_000,
+    resetCreditsAvailable: 1,
+    resetCreditsApplicable: 0
+  };
+  assert.notEqual(parseRelayServerMessage(valid), null);
+  const invalidUsage = structuredClone(valid);
+  invalidUsage.snapshot.usage!.windows[0]!.remainingPercent = 101;
+  assert.equal(parseRelayServerMessage(invalidUsage), null);
+  valid.snapshot.activeThreadKey = "local:not-a-thread";
+  assert.equal(parseRelayServerMessage(valid), null);
+  valid.snapshot.activeThreadKey = "local:00000000-0000-4000-8000-000000000000";
+  valid.snapshot.activeThreadTitle = "x".repeat(241);
+  assert.equal(parseRelayServerMessage(valid), null);
+  delete valid.snapshot.activeThreadTitle;
+  delete valid.snapshot.activeThreadKey;
+  const invalidRevision = structuredClone(valid);
+  invalidRevision.snapshot.hostSessions![0]!.completionRevision = -1;
+  assert.equal(parseRelayServerMessage(invalidRevision), null);
+  const invalidContext = structuredClone(valid);
+  invalidContext.snapshot.slots[0]!.contextUsedPercent = 101;
+  assert.equal(parseRelayServerMessage(invalidContext), null);
+  const invalid = structuredClone(valid) as typeof valid & { snapshot: { hostSessions: unknown[] } };
+  invalid.snapshot.hostSessions = Array.from({ length: 129 }, () => valid.snapshot.hostSessions![0]!);
+  assert.equal(parseRelayServerMessage(invalid), null);
+  assert.notEqual(parseRelayServerMessage({
+    type: "health", protocol: 1, host, state: "degraded",
+    reason: "native-signals-unavailable", observedAt: 2
+  }), null);
+  assert.equal(parseRelayServerMessage({
+    type: "health", protocol: 1, host, state: "offline",
+    reason: "native-signals-unavailable", observedAt: 2
+  }), null);
+});
+
+test("relay health becomes degraded from local receipt age without trusting remote clocks", () => {
+  const ready = { state: "ready", changedAt: 900 } as const;
+  assert.equal(resolveRelayHealth(ready, true, 1_000, 1_000 + RELAY_SNAPSHOT_STALE_MS).state, "ready");
+  assert.deepEqual(resolveRelayHealth(ready, true, 1_000, 1_001 + RELAY_SNAPSHOT_STALE_MS), {
+    state: "degraded", reason: "snapshot-stale", changedAt: 1_000
+  });
+  const offline = { state: "offline", reason: "relay-disconnected", changedAt: 2_000 } as const;
+  assert.equal(resolveRelayHealth(offline, true, 1_000, 99_000), offline);
+});
+
+test("remote snapshots are normalized to the receiver clock", () => {
+  const remote = structuredClone(snapshot);
+  remote.hostSessions = [{
+    threadId: remote.slots[0]!.threadKey!, activityAt: 970_000,
+    status: "working", completionRevision: undefined
+  }];
+  remote.usage = {
+    windows: [{
+      id: "weekly", kind: "weekly", usedPercent: 40, remainingPercent: 60,
+      windowDurationMins: 10_080, resetsAt: 1_600_000
+    }],
+    observedAt: 1_000_000,
+    resetCreditsAvailable: 1,
+    resetCreditsApplicable: 1
+  };
+  remote.slots[0]!.activityAt = 990_000;
+
+  const normalized = normalizeHostSnapshotAtReceipt(
+    { host, snapshot: remote, observedAt: 1_000_000 }, 1_030_000);
+  assert.equal(normalized.observedAt, 1_030_000);
+  assert.equal(normalized.snapshot.slots[0]!.activityAt, 1_020_000);
+  assert.equal(normalized.snapshot.hostSessions![0]!.activityAt, 1_000_000);
+  assert.equal(normalized.snapshot.usage!.observedAt, 1_030_000);
+  assert.equal(normalized.snapshot.usage!.windows[0]!.resetsAt, 1_630_000);
+});
+
+test("clock skew cannot hide a remote owner status or selection", () => {
+  const windows: CodexHost = {
+    hostId: "11111111-1111-4111-8111-111111111111", hostName: "Windows", platform: "win32"
+  };
+  const threadKey = snapshot.slots[0]!.threadKey!;
+  const macMirror = structuredClone(snapshot);
+  const windowsOwner = structuredClone(snapshot);
+  macMirror.slots[0]!.status = "idle";
+  macMirror.slots[0]!.selected = false;
+  macMirror.slots[0]!.ownedByHost = false;
+  windowsOwner.slots[0]!.status = "working";
+  windowsOwner.slots[0]!.selected = true;
+  windowsOwner.slots[0]!.ownedByHost = true;
+  windowsOwner.hostSessions = [{
+    threadId: threadKey, activityAt: 995_000, status: "working", completionRevision: undefined
+  }];
+  const normalizedRemote = normalizeHostSnapshotAtReceipt(
+    { host: windows, snapshot: windowsOwner, observedAt: 1_000_000 }, 1_030_000);
+  const merged = new HostActivityIndex().merge([
+    { host, snapshot: macMirror, observedAt: 1_030_000 }, normalizedRemote
+  ]);
+  const task = merged.find((slot) => slot.threadKey === threadKey)!;
+  assert.equal(task.status, "working");
+  assert.equal(task.selected, true);
+  assert.equal(task.host.hostId, windows.hostId);
+});
+
+test("relay suppresses one transient renderer failure after a healthy snapshot", () => {
+  assert.equal(relaySnapshotFailureShouldDegrade(false, 1), true, "initial failure has no safe snapshot");
+  assert.equal(relaySnapshotFailureShouldDegrade(true, 1), false, "one transient failure keeps last-known state");
+  assert.equal(relaySnapshotFailureShouldDegrade(true, 2), true, "repeated failures surface degraded health");
+});
+
+test("host activity merge globally orders explicit Mac and Windows timestamps", () => {
+  const windows: CodexHost = { hostId: "11111111-1111-4111-8111-111111111111", hostName: "Windows", platform: "win32" };
+  const macSnapshot = structuredClone(snapshot);
+  const windowsSnapshot = structuredClone(snapshot);
+  for (const slot of windowsSnapshot.slots) slot.threadKey = `10000000-0000-4000-8000-00000000000${slot.id}`;
+  for (const slot of [...macSnapshot.slots, ...windowsSnapshot.slots]) slot.activityAt = 1;
+  macSnapshot.slots[0]!.activityAt = 100;
+  windowsSnapshot.slots[0]!.activityAt = 200;
+  const merged = new HostActivityIndex().merge([
+    { host, snapshot: macSnapshot, observedAt: 1_000 },
+    { host: windows, snapshot: windowsSnapshot, observedAt: 1_000 }
+  ]);
+  assert.equal(merged[0]!.host.platform, "win32");
+  assert.equal(merged[0]!.sourceSlot, 0);
+  assert.ok(merged.some((slot) => slot.host.platform === "darwin"));
+});
+
+test("a newly connected host cannot make unknown historical activity look recent", () => {
+  const windows: CodexHost = { hostId: "11111111-1111-4111-8111-111111111111", hostName: "Windows", platform: "win32" };
+  const macSnapshot = structuredClone(snapshot);
+  const windowsSnapshot = structuredClone(snapshot);
+  for (const slot of [...macSnapshot.slots, ...windowsSnapshot.slots]) {
+    delete slot.activityAt;
+    slot.status = "idle";
+    slot.selected = false;
+  }
+  windowsSnapshot.slots[0]!.selected = true;
+  windowsSnapshot.slots[0]!.status = "working";
+  const merged = new HostActivityIndex().merge([
+    { host: windows, snapshot: windowsSnapshot, observedAt: 1_000 },
+    { host, snapshot: macSnapshot, observedAt: 9_000 }
+  ]);
+  assert.equal(merged[0]!.host.platform, "win32");
+  assert.equal(merged[0]!.threadKey, windowsSnapshot.slots[0]!.threadKey);
+  assert.equal(merged[0]!.activityAt, 0);
+});
+
+test("an idle cloud thread visible on both hosts keeps the first stable owner", () => {
+  const windows: CodexHost = { hostId: "11111111-1111-4111-8111-111111111111", hostName: "Windows", platform: "win32" };
+  const shared = "00000000-0000-4000-8000-000000000000";
+  const macSnapshot = structuredClone(snapshot);
+  const windowsSnapshot = structuredClone(snapshot);
+  for (const candidate of [macSnapshot.slots[5]!, windowsSnapshot.slots[5]!]) {
+    candidate.threadKey = shared;
+    candidate.status = "idle";
+    candidate.selected = false;
+    delete candidate.activityAt;
+  }
+  const match = new HostActivityIndex().merge([
+    { host: windows, snapshot: windowsSnapshot, observedAt: 1_000 },
+    { host, snapshot: macSnapshot, observedAt: 9_000 }
+  ]).find((slot) => slot.threadKey === shared);
+  assert.equal(match?.host.platform, "win32");
+});
+
+test("backing rollout ownership beats a mirrored remote-SSH recent entry", () => {
+  const windows: CodexHost = { hostId: "11111111-1111-4111-8111-111111111111", hostName: "Windows", platform: "win32" };
+  const shared = "00000000-0000-4000-8000-000000000000";
+  const macSnapshot = structuredClone(snapshot);
+  const windowsSnapshot = structuredClone(snapshot);
+  macSnapshot.slots[0] = { ...macSnapshot.slots[0]!, threadKey: shared, status: "idle", selected: false, ownedByHost: true };
+  windowsSnapshot.slots[0] = { ...windowsSnapshot.slots[0]!, threadKey: shared, status: "working", selected: true, ownedByHost: false };
+  const match = new HostActivityIndex().merge([
+    { host: windows, snapshot: windowsSnapshot, observedAt: 2_000 },
+    { host, snapshot: macSnapshot, observedAt: 1_000 }
+  ]).find((slot) => slot.threadKey === shared);
+  assert.equal(match?.host.platform, "darwin", "commands route to the host with the rollout");
+  assert.equal(match?.status, "working", "the strongest mirrored live status remains visible");
+  assert.equal(match?.selected, true, "selection is aggregated across both visible mirrors");
+});
+
+test("a stale mirrored working state cannot override a fresh idle owner", () => {
+  const windows: CodexHost = { hostId: "11111111-1111-4111-8111-111111111111", hostName: "Windows", platform: "win32" };
+  const shared = "00000000-0000-4000-8000-000000000000";
+  const macSnapshot = structuredClone(snapshot);
+  const windowsSnapshot = structuredClone(snapshot);
+  macSnapshot.slots[0] = {
+    ...macSnapshot.slots[0]!, threadKey: shared, status: "idle", selected: false, ownedByHost: true
+  };
+  windowsSnapshot.slots[0] = {
+    ...windowsSnapshot.slots[0]!, threadKey: shared, status: "working", selected: true, ownedByHost: false
+  };
+  const match = new HostActivityIndex().merge([
+    { host: windows, snapshot: windowsSnapshot, observedAt: 1_000 },
+    { host, snapshot: macSnapshot, observedAt: 7_001 }
+  ]).find((slot) => slot.threadKey === shared);
+  assert.equal(match?.host.platform, "darwin", "the backing host still receives commands");
+  assert.equal(match?.status, "idle", "fresh native state wins over a stale mirror");
+  assert.equal(match?.selected, false, "stale remote selection is not aggregated");
+});
+
+test("a recent mirrored working state still augments a fresh idle owner", () => {
+  const windows: CodexHost = { hostId: "11111111-1111-4111-8111-111111111111", hostName: "Windows", platform: "win32" };
+  const shared = "00000000-0000-4000-8000-000000000000";
+  const macSnapshot = structuredClone(snapshot);
+  const windowsSnapshot = structuredClone(snapshot);
+  macSnapshot.slots[0] = {
+    ...macSnapshot.slots[0]!, threadKey: shared, status: "idle", selected: false, ownedByHost: true
+  };
+  windowsSnapshot.slots[0] = {
+    ...windowsSnapshot.slots[0]!, threadKey: shared, status: "working", selected: true, ownedByHost: false
+  };
+  const match = new HostActivityIndex().merge([
+    { host: windows, snapshot: windowsSnapshot, observedAt: 3_000 },
+    { host, snapshot: macSnapshot, observedAt: 7_001 }
+  ]).find((slot) => slot.threadKey === shared);
+  assert.equal(match?.status, "working");
+  assert.equal(match?.selected, true);
+});
+
+test("host session catalogs route a mirror even when the owning host has no native slot for it", () => {
+  const windows: CodexHost = { hostId: "11111111-1111-4111-8111-111111111111", hostName: "Windows", platform: "win32" };
+  const shared = "00000000-0000-4000-8000-000000000000";
+  const macSnapshot = structuredClone(snapshot);
+  const windowsSnapshot = structuredClone(snapshot);
+  macSnapshot.slots[0] = { ...macSnapshot.slots[0]!, threadKey: "40000000-0000-4000-8000-000000000099", status: "idle" };
+  windowsSnapshot.slots[0] = { ...windowsSnapshot.slots[0]!, threadKey: shared, title: "Mac-owned task", status: "idle", ownedByHost: false };
+  macSnapshot.hostSessions = [{ threadId: shared, activityAt: 2_000, status: "working" }];
+  const match = new HostActivityIndex().merge([
+    { host: windows, snapshot: windowsSnapshot, observedAt: 2_000 },
+    { host, snapshot: macSnapshot, observedAt: 2_000 }
+  ], 2_000, windows.hostId).find((slot) => slot.threadKey === shared);
+  assert.equal(match?.host.platform, "darwin");
+  assert.equal(match?.status, "working");
+  assert.equal(match?.title, "Mac-owned task");
+});
+
+test("host session catalogs return a Mac-only cloud mirror to its Windows owner", () => {
+  const windows: CodexHost = { hostId: "11111111-1111-4111-8111-111111111111", hostName: "Windows", platform: "win32" };
+  const shared = "00000000-0000-4000-8000-000000000000";
+  const macSnapshot = structuredClone(snapshot);
+  const windowsSnapshot = structuredClone(snapshot);
+  macSnapshot.slots[0] = { ...macSnapshot.slots[0]!, threadKey: shared, status: "working", ownedByHost: false };
+  windowsSnapshot.slots[0] = { ...windowsSnapshot.slots[0]!, threadKey: "40000000-0000-4000-8000-000000000099", status: "idle" };
+  windowsSnapshot.hostSessions = [{ threadId: shared, activityAt: 2_000, status: "idle" }];
+  const match = new HostActivityIndex().merge([
+    { host: windows, snapshot: windowsSnapshot, observedAt: 2_000 },
+    { host, snapshot: macSnapshot, observedAt: 2_000 }
+  ], 2_000, windows.hostId).find((slot) => slot.threadKey === shared);
+  assert.equal(match?.host.platform, "win32");
+  assert.equal(match?.status, "working");
+});
+
+test("temporary Windows new-thread keys merge with a titleless session-backed Mac mirror", () => {
+  const windows: CodexHost = {
+    hostId: "11111111-1111-4111-8111-111111111111", hostName: "Windows", platform: "win32"
+  };
+  const temporary = "local:client-new-thread:819699e8-ed6d-46fb-bfd1-3280c028de2b";
+  const rollout = "019f804a-4e0a-7b32-bf66-af64a405d2d5";
+  const title = "Autocheck 3 Installation prüfen";
+  const windowsSnapshot = structuredClone(snapshot);
+  const macSnapshot = structuredClone(snapshot);
+  windowsSnapshot.agentSource = "priority";
+  macSnapshot.agentSource = "priority";
+  windowsSnapshot.activeThreadKey = rollout;
+  windowsSnapshot.slots[0] = {
+    ...windowsSnapshot.slots[0]!, threadKey: temporary, title, status: "idle",
+    selected: true, ownedByHost: false
+  };
+  windowsSnapshot.hostSessions = [
+    { threadId: rollout, activityAt: 2_000, status: "working", contextUsedPercent: 59 }
+  ];
+  macSnapshot.slots[0] = {
+    ...macSnapshot.slots[0]!, threadKey: `local:${rollout}`, title: null, status: "working",
+    selected: false, ownedByHost: false
+  };
+
+  const index = new HostActivityIndex();
+  const merged = index.merge([
+    { host: windows, snapshot: windowsSnapshot, observedAt: 2_000 },
+    { host, snapshot: macSnapshot, observedAt: 2_000 }
+  ], 2_000, windows.hostId);
+  const matches = merged.filter((slot) => slot.title === title);
+
+  assert.equal(matches.length, 1);
+  assert.equal(matches[0]!.host.platform, "win32");
+  assert.equal(matches[0]!.sourceSlot, 0);
+  assert.equal(matches[0]!.threadKey, temporary, "commands keep the live Windows slot key");
+  assert.equal(matches[0]!.selected, true);
+  assert.equal(matches[0]!.status, "working", "the live mirror status remains visible");
+  assert.equal(matches[0]!.contextUsedPercent, 59);
+
+  windowsSnapshot.slots[0]!.selected = false;
+  windowsSnapshot.activeThreadKey = "10000000-0000-4000-8000-000000000000";
+  const afterSelectionMoves = index.merge([
+    { host: windows, snapshot: windowsSnapshot, observedAt: 3_000 },
+    { host, snapshot: macSnapshot, observedAt: 3_000 }
+  ], 3_000, windows.hostId).filter((slot) => slot.threadKey?.endsWith(rollout) || slot.threadKey === temporary);
+  assert.equal(afterSelectionMoves.length, 1, "the learned alias survives a later selection change");
+  assert.equal(afterSelectionMoves[0]!.title, title);
+});
+
+test("a titled mirror supplies the label when the rollout owner is titleless", () => {
+  const windows: CodexHost = {
+    hostId: "11111111-1111-4111-8111-111111111111", hostName: "Windows", platform: "win32"
+  };
+  const shared = "11000000-0000-4000-8000-000000000000";
+  const windowsSnapshot = structuredClone(snapshot);
+  const macSnapshot = structuredClone(snapshot);
+  windowsSnapshot.slots[0] = {
+    ...windowsSnapshot.slots[0]!, threadKey: shared, title: "Visible on Windows", ownedByHost: false
+  };
+  macSnapshot.slots[0] = {
+    ...macSnapshot.slots[0]!, threadKey: `local:${shared}`, title: null, ownedByHost: true
+  };
+  macSnapshot.hostSessions = [{ threadId: shared, activityAt: 2_000, status: "idle" }];
+
+  const merged = new HostActivityIndex().merge([
+    { host: windows, snapshot: windowsSnapshot, observedAt: 2_000 },
+    { host, snapshot: macSnapshot, observedAt: 2_000 }
+  ], 2_000, windows.hostId);
+  const matches = merged.filter((slot) => slot.threadKey?.endsWith(shared));
+  assert.equal(matches.length, 1);
+  assert.equal(matches[0]!.host.platform, "darwin");
+  assert.equal(matches[0]!.title, "Visible on Windows");
+});
+
+test("a learned Mac new-thread alias survives a Windows relay reconnect", () => {
+  const windows: CodexHost = {
+    hostId: "11111111-1111-4111-8111-111111111111", hostName: "Windows", platform: "win32"
+  };
+  const temporary = "local:client-new-thread:12000000-0000-4000-8000-000000000000";
+  const rollout = "13000000-0000-4000-8000-000000000000";
+  const title = "New Mac task";
+  const windowsSnapshot = structuredClone(snapshot);
+  const macSnapshot = structuredClone(snapshot);
+  windowsSnapshot.agentSource = "priority";
+  macSnapshot.agentSource = "priority";
+  windowsSnapshot.slots[0] = {
+    ...windowsSnapshot.slots[0]!, threadKey: rollout, title: null, status: "working",
+    selected: false, ownedByHost: false
+  };
+  macSnapshot.activeThreadKey = rollout;
+  macSnapshot.slots[0] = {
+    ...macSnapshot.slots[0]!, threadKey: temporary, title, status: "working",
+    selected: true, ownedByHost: false
+  };
+  macSnapshot.hostSessions = [
+    { threadId: rollout, activityAt: 2_000, status: "working", contextUsedPercent: 12 }
+  ];
+  const index = new HostActivityIndex();
+  const inputs = () => [
+    { host: windows, snapshot: windowsSnapshot, observedAt: 2_000 },
+    { host, snapshot: macSnapshot, observedAt: 2_000 }
+  ];
+
+  assert.equal(index.merge(inputs(), 2_000, windows.hostId)
+    .filter((slot) => slot.threadKey?.endsWith(rollout) || slot.threadKey === temporary).length, 1);
+  index.merge([{ host: windows, snapshot: windowsSnapshot, observedAt: 2_500 }], 2_500, windows.hostId);
+  macSnapshot.slots[0]!.selected = false;
+  macSnapshot.activeThreadKey = "14000000-0000-4000-8000-000000000000";
+  const reconnected = index.merge(inputs().map((input) => ({ ...input, observedAt: 3_000 })), 3_000, windows.hostId)
+    .filter((slot) => slot.threadKey?.endsWith(rollout) || slot.threadKey === temporary);
+  assert.equal(reconnected.length, 1);
+  assert.equal(reconnected[0]!.host.platform, "darwin");
+  assert.equal(reconnected[0]!.title, title);
+  assert.equal(reconnected[0]!.contextUsedPercent, 12);
+});
+
+test("delayed mirror status does not reorder an owned active task", () => {
+  const windows: CodexHost = { hostId: "11111111-1111-4111-8111-111111111111", hostName: "Windows", platform: "win32" };
+  const shared = "00000000-0000-4000-8000-000000000000";
+  const macSnapshot = structuredClone(snapshot);
+  const windowsSnapshot = structuredClone(snapshot);
+  for (const slot of [...macSnapshot.slots, ...windowsSnapshot.slots]) {
+    slot.status = "idle";
+    slot.selected = false;
+    delete slot.activityAt;
+  }
+  macSnapshot.slots[0] = { ...macSnapshot.slots[0]!, threadKey: shared, ownedByHost: true };
+  windowsSnapshot.slots[0] = { ...windowsSnapshot.slots[0]!, threadKey: shared, ownedByHost: false };
+  const index = new HostActivityIndex();
+  index.merge([
+    { host, snapshot: macSnapshot, observedAt: 500 },
+    { host: windows, snapshot: windowsSnapshot, observedAt: 500 }
+  ]);
+
+  macSnapshot.slots[0]!.status = "working";
+  macSnapshot.slots[0]!.selected = true;
+  let match = index.merge([
+    { host, snapshot: macSnapshot, observedAt: 1_000 },
+    { host: windows, snapshot: windowsSnapshot, observedAt: 1_000 }
+  ]).find((slot) => slot.threadKey === shared);
+  assert.equal(match?.activityAt, 1_000);
+
+  windowsSnapshot.slots[0]!.status = "working";
+  windowsSnapshot.slots[0]!.selected = true;
+  match = index.merge([
+    { host, snapshot: macSnapshot, observedAt: 2_000 },
+    { host: windows, snapshot: windowsSnapshot, observedAt: 2_000 }
+  ]).find((slot) => slot.threadKey === shared);
+  assert.equal(match?.activityAt, 1_000, "the delayed non-owner mirror cannot refresh recency");
+});
+
+test("the same cloud thread is shown once and owned by its live active host", () => {
+  const windows: CodexHost = { hostId: "11111111-1111-4111-8111-111111111111", hostName: "Windows", platform: "win32" };
+  const macSnapshot = structuredClone(snapshot);
+  const windowsSnapshot = structuredClone(snapshot);
+  const shared = "00000000-0000-4000-8000-000000000000";
+  macSnapshot.slots[0] = { ...macSnapshot.slots[0]!, threadKey: shared, status: "working", activityAt: 100 };
+  windowsSnapshot.slots[0] = { ...windowsSnapshot.slots[0]!, threadKey: shared, status: "idle", activityAt: 200 };
+  const index = new HostActivityIndex();
+  const merged = index.merge([
+    { host, snapshot: macSnapshot, observedAt: 1_000 },
+    { host: windows, snapshot: windowsSnapshot, observedAt: 1_000 }
+  ]);
+  const matches = merged.filter((slot) => slot.threadKey === shared);
+  assert.equal(matches.length, 1);
+  assert.equal(matches[0]!.host.platform, "darwin");
+  assert.equal(matches[0]!.status, "working");
+
+  macSnapshot.slots[0] = { ...macSnapshot.slots[0]!, status: "idle" };
+  const afterCompletion = index.merge([
+    { host, snapshot: macSnapshot, observedAt: 2_000 },
+    { host: windows, snapshot: windowsSnapshot, observedAt: 2_000 }
+  ]).find((slot) => slot.threadKey === shared);
+  assert.equal(afterCompletion?.host.platform, "darwin", "the host that completed the task retains ownership");
+});
+
+test("single-host agent modes preserve Codex's native six-slot order", () => {
+  const pinned = structuredClone(snapshot);
+  pinned.agentSource = "pinned";
+  for (const slot of pinned.slots) {
+    slot.status = "idle";
+    slot.selected = false;
+    slot.activityAt = slot.id;
+  }
+  const merged = new HostActivityIndex().merge([{ host, snapshot: pinned, observedAt: 1_000 }], 1_000, host.hostId);
+  assert.deepEqual(merged.map((slot) => slot.threadKey), pinned.slots.map((slot) => slot.threadKey));
+  assert.deepEqual(merged.map((slot) => slot.id), [0, 1, 2, 3, 4, 5]);
+});
+
+test("combined pinned mode interleaves both hosts and routes mirrored tasks to the owner", () => {
+  const windows: CodexHost = { hostId: "11111111-1111-4111-8111-111111111111", hostName: "Windows", platform: "win32" };
+  const shared = "20000000-0000-4000-8000-000000000000";
+  const windowsSnapshot = structuredClone(snapshot);
+  const macSnapshot = structuredClone(snapshot);
+  windowsSnapshot.agentSource = "pinned";
+  macSnapshot.agentSource = "pinned";
+  for (const slot of windowsSnapshot.slots) slot.threadKey = `21000000-0000-4000-8000-00000000000${slot.id}`;
+  for (const slot of macSnapshot.slots) slot.threadKey = `22000000-0000-4000-8000-00000000000${slot.id}`;
+  windowsSnapshot.slots[0] = { ...windowsSnapshot.slots[0]!, threadKey: shared, ownedByHost: false };
+  macSnapshot.slots[4] = { ...macSnapshot.slots[4]!, threadKey: shared, ownedByHost: true };
+  const merged = new HostActivityIndex().merge([
+    { host: windows, snapshot: windowsSnapshot, observedAt: 1_000 },
+    { host, snapshot: macSnapshot, observedAt: 1_000 }
+  ], 1_000, windows.hostId);
+  assert.equal(merged[0]!.threadKey, shared);
+  assert.equal(merged[0]!.host.platform, "darwin");
+  assert.equal(merged[0]!.sourceSlot, 4);
+  assert.deepEqual(merged.slice(1).map((slot) => slot.threadKey), [
+    macSnapshot.slots[0]!.threadKey,
+    windowsSnapshot.slots[1]!.threadKey,
+    macSnapshot.slots[1]!.threadKey,
+    windowsSnapshot.slots[2]!.threadKey,
+    macSnapshot.slots[2]!.threadKey
+  ]);
+});
+
+test("combined custom mode uses the remote assignment when the controller slot is empty", () => {
+  const windows: CodexHost = { hostId: "11111111-1111-4111-8111-111111111111", hostName: "Windows", platform: "win32" };
+  const windowsSnapshot = structuredClone(snapshot);
+  const macSnapshot = structuredClone(snapshot);
+  windowsSnapshot.agentSource = "custom";
+  macSnapshot.agentSource = "custom";
+  windowsSnapshot.slots[0] = { id: 0, threadKey: null, title: null, status: "off", selected: false };
+  macSnapshot.slots[0] = { ...macSnapshot.slots[0]!, threadKey: "30000000-0000-4000-8000-000000000000", ownedByHost: true };
+  const merged = new HostActivityIndex().merge([
+    { host: windows, snapshot: windowsSnapshot, observedAt: 1_000 },
+    { host, snapshot: macSnapshot, observedAt: 1_000 }
+  ], 1_000, windows.hostId);
+  assert.equal(merged[0]!.threadKey, macSnapshot.slots[0]!.threadKey);
+  assert.equal(merged[0]!.host.platform, "darwin");
+  assert.equal(merged[0]!.sourceSlot, 0);
+});
+
+test("combined custom mode keeps the controller assignment when both hosts configure one button", () => {
+  const windows: CodexHost = { hostId: "11111111-1111-4111-8111-111111111111", hostName: "Windows", platform: "win32" };
+  const windowsSnapshot = structuredClone(snapshot);
+  const macSnapshot = structuredClone(snapshot);
+  windowsSnapshot.agentSource = "custom";
+  macSnapshot.agentSource = "custom";
+  windowsSnapshot.slots[0] = { ...windowsSnapshot.slots[0]!, threadKey: "31000000-0000-4000-8000-000000000000" };
+  macSnapshot.slots[0] = { ...macSnapshot.slots[0]!, threadKey: "32000000-0000-4000-8000-000000000000" };
+  const merged = new HostActivityIndex().merge([
+    { host: windows, snapshot: windowsSnapshot, observedAt: 1_000 },
+    { host, snapshot: macSnapshot, observedAt: 1_000 }
+  ], 1_000, windows.hostId);
+  assert.equal(merged[0]!.threadKey, windowsSnapshot.slots[0]!.threadKey);
+  assert.equal(merged[0]!.host.platform, "win32");
+});
+
+test("combined custom mode de-duplicates prefixed mirrors and routes them to the rollout owner", () => {
+  const windows: CodexHost = { hostId: "11111111-1111-4111-8111-111111111111", hostName: "Windows", platform: "win32" };
+  const windowsSnapshot = structuredClone(snapshot);
+  const macSnapshot = structuredClone(snapshot);
+  windowsSnapshot.agentSource = "custom";
+  macSnapshot.agentSource = "custom";
+  const id = "33000000-0000-4000-8000-000000000000";
+  windowsSnapshot.slots[0] = { ...windowsSnapshot.slots[0]!, threadKey: `local:${id}`, ownedByHost: false };
+  macSnapshot.slots[1] = { ...macSnapshot.slots[1]!, threadKey: `local:client-new-thread:${id}`, ownedByHost: true };
+  const merged = new HostActivityIndex().merge([
+    { host: windows, snapshot: windowsSnapshot, observedAt: 1_000 },
+    { host, snapshot: macSnapshot, observedAt: 1_000 }
+  ], 1_000, windows.hostId);
+  assert.equal(merged.filter((slot) => slot.threadKey?.endsWith(id)).length, 1);
+  assert.equal(merged[0]!.host.platform, "darwin");
+  assert.equal(merged[0]!.sourceSlot, 1);
+  assert.equal(merged[1]!.threadKey, windowsSnapshot.slots[1]!.threadKey);
+});
+
+test("combined priority mode ranks waiting, unread, active, then idle", () => {
+  const windows: CodexHost = { hostId: "11111111-1111-4111-8111-111111111111", hostName: "Windows", platform: "win32" };
+  const windowsSnapshot = structuredClone(snapshot);
+  const macSnapshot = structuredClone(snapshot);
+  windowsSnapshot.agentSource = "priority";
+  for (const slot of [...windowsSnapshot.slots, ...macSnapshot.slots]) {
+    slot.status = "idle";
+    slot.selected = false;
+    slot.activityAt = 1;
+  }
+  macSnapshot.slots[0] = { ...macSnapshot.slots[0]!, threadKey: "40000000-0000-4000-8000-000000000000", status: "working" };
+  macSnapshot.slots[1] = { ...macSnapshot.slots[1]!, threadKey: "40000000-0000-4000-8000-000000000001", status: "unread" };
+  macSnapshot.slots[2] = { ...macSnapshot.slots[2]!, threadKey: "40000000-0000-4000-8000-000000000002", status: "awaiting-approval" };
+  const merged = new HostActivityIndex().merge([
+    { host: windows, snapshot: windowsSnapshot, observedAt: 1_000 },
+    { host, snapshot: macSnapshot, observedAt: 1_000 }
+  ], 1_000, windows.hostId);
+  assert.deepEqual(merged.slice(0, 3).map((slot) => slot.status), ["awaiting-approval", "unread", "working"]);
+});
+
+test("combined priority mode keeps freshly completed owner sessions ahead of idle tasks", () => {
+  const windows: CodexHost = { hostId: "11111111-1111-4111-8111-111111111111", hostName: "Windows", platform: "win32" };
+  const windowsSnapshot = structuredClone(snapshot);
+  const macSnapshot = structuredClone(snapshot);
+  const completed = "50000000-0000-4000-8000-000000000000";
+  windowsSnapshot.agentSource = "priority";
+  macSnapshot.agentSource = "priority";
+  for (const slot of [...windowsSnapshot.slots, ...macSnapshot.slots]) {
+    slot.status = "idle";
+    slot.selected = false;
+    slot.activityAt = 1;
+  }
+  windowsSnapshot.slots[4] = { ...windowsSnapshot.slots[4]!, threadKey: completed, status: "idle" };
+  macSnapshot.hostSessions = [{ threadId: completed, activityAt: 2_000, status: "complete" }];
+  const merged = new HostActivityIndex().merge([
+    { host: windows, snapshot: windowsSnapshot, observedAt: 2_000 },
+    { host, snapshot: macSnapshot, observedAt: 2_000 }
+  ], 2_000, windows.hostId);
+  assert.equal(merged[0]!.threadKey, completed);
+  assert.equal(merged[0]!.host.platform, "darwin");
+  assert.equal(merged[0]!.status, "complete");
+});
+
+test("a completion opened through a cross-host mirror stays idle until a new completion revision", () => {
+  const windows: CodexHost = { hostId: "11111111-1111-4111-8111-111111111111", hostName: "Windows", platform: "win32" };
+  const windowsSnapshot = structuredClone(snapshot);
+  const macSnapshot = structuredClone(snapshot);
+  const completed = "50000000-0000-4000-8000-000000000001";
+  for (const slot of [...windowsSnapshot.slots, ...macSnapshot.slots]) {
+    slot.status = "idle";
+    slot.selected = false;
+    slot.activityAt = 1;
+  }
+  windowsSnapshot.slots[0] = { ...windowsSnapshot.slots[0]!, threadKey: "50000000-0000-4000-8000-000000000099" };
+  windowsSnapshot.activeThreadKey = `local:${completed}`;
+  macSnapshot.slots[0] = { ...macSnapshot.slots[0]!, threadKey: completed, ownedByHost: true };
+  macSnapshot.hostSessions = [{ threadId: completed, activityAt: 1_900, status: "working" }];
+  const index = new HostActivityIndex();
+  const inputs = () => [
+    { host: windows, snapshot: windowsSnapshot, observedAt: 2_000 },
+    { host, snapshot: macSnapshot, observedAt: 2_000 }
+  ];
+
+  assert.equal(index.merge(inputs(), 2_000, windows.hostId).find((slot) => slot.threadKey === completed)?.status, "working");
+  macSnapshot.hostSessions[0] = { threadId: completed, activityAt: 2_000, status: "complete", completionRevision: 10 };
+  assert.equal(index.merge(inputs(), 2_001, windows.hostId).find((slot) => slot.threadKey === completed)?.status, "idle");
+  delete windowsSnapshot.activeThreadKey;
+  index.merge(inputs(), 2_002, windows.hostId);
+  windowsSnapshot.activeThreadKey = `local:${completed}`;
+  assert.equal(index.merge(inputs(), 2_003, windows.hostId).find((slot) => slot.threadKey === completed)?.status, "idle");
+  delete windowsSnapshot.activeThreadKey;
+  assert.equal(index.merge(inputs(), 2_004, windows.hostId).find((slot) => slot.threadKey === completed)?.status, "idle");
+
+  macSnapshot.hostSessions[0]!.completionRevision = 20;
+  assert.equal(index.merge(inputs(), 2_005, windows.hostId).find((slot) => slot.threadKey === completed)?.status, "complete");
+  macSnapshot.slots[0]!.status = "working";
+  assert.equal(index.merge(inputs(), 2_006, windows.hostId).find((slot) => slot.threadKey === completed)?.status, "working");
+});
+
+test("host lifecycle preserves fresh native approval attention", () => {
+  const windows: CodexHost = { hostId: "11111111-1111-4111-8111-111111111111", hostName: "Windows", platform: "win32" };
+  const windowsSnapshot = structuredClone(snapshot);
+  const macSnapshot = structuredClone(snapshot);
+  const threadId = "50000000-0000-4000-8000-000000000003";
+  windowsSnapshot.slots[0] = { ...windowsSnapshot.slots[0]!, threadKey: threadId, status: "working" };
+  macSnapshot.slots[0] = { ...macSnapshot.slots[0]!, threadKey: threadId, status: "awaiting-approval", ownedByHost: true };
+  macSnapshot.hostSessions = [{ threadId, activityAt: 2_000, status: "idle" }];
+  const merged = new HostActivityIndex().merge([
+    { host: windows, snapshot: windowsSnapshot, observedAt: 2_000 },
+    { host, snapshot: macSnapshot, observedAt: 2_000 }
+  ], 2_000, windows.hostId);
+  assert.equal(merged.find((slot) => slot.threadKey === threadId)?.status, "awaiting-approval");
+});
+
+test("an old session completion cannot resurrect a current native idle slot", () => {
+  const windows: CodexHost = { hostId: "11111111-1111-4111-8111-111111111111", hostName: "Windows", platform: "win32" };
+  const windowsSnapshot = structuredClone(snapshot);
+  const macSnapshot = structuredClone(snapshot);
+  const completed = "50000000-0000-4000-8000-000000000002";
+  for (const slot of [...windowsSnapshot.slots, ...macSnapshot.slots]) {
+    slot.status = "idle";
+    slot.selected = false;
+  }
+  windowsSnapshot.slots[0] = { ...windowsSnapshot.slots[0]!, threadKey: completed, ownedByHost: false };
+  macSnapshot.slots[0] = { ...macSnapshot.slots[0]!, threadKey: completed, ownedByHost: true };
+  macSnapshot.hostSessions = [{
+    threadId: completed, activityAt: 1_000, status: "complete", completionRevision: 10
+  }];
+  const observedAt = 1_000 + 5 * 60_000 + 1;
+  const merged = new HostActivityIndex().merge([
+    { host: windows, snapshot: windowsSnapshot, observedAt },
+    { host, snapshot: macSnapshot, observedAt }
+  ], observedAt, windows.hostId);
+
+  assert.equal(merged.find((slot) => slot.threadKey === completed)?.status, "idle");
+});
+
+test("authenticated relay publishes snapshots and dispatches typed commands", async () => {
+  const port = await freePort();
+  const calls: unknown[] = [];
+  const control = {
+    refresh: async () => snapshot,
+    sendAgent: async (slot: number, act: 0 | 1) => { calls.push(["agent", slot, act]); },
+    sendAction: async () => {}, sendJoystick: async () => {}, sendEncoder: async () => {},
+    adjustReasoning: async () => {}, runKeycap: async () => {}, consumeRateLimitReset: async () => {}
+  };
+  const server = new CodexRelayServer(
+    { enabled: true, listenHost: "127.0.0.1", port, token: "t".repeat(32) }, host, control, () => {}
+  );
+  await server.start();
+  const socket = new WebSocket(`ws://127.0.0.1:${port}`);
+  const messages = messageQueue(socket);
+  await onceOpen(socket);
+  socket.send(JSON.stringify({ type: "auth", protocol: RELAY_PROTOCOL_VERSION, token: "t".repeat(32) }));
+  const first = await messages.next();
+  assert.equal(first.type, "ready");
+  assert.equal(first.bridge, "native-codex-micro");
+  assert.deepEqual(first.capabilities, [
+    "agent", "action", "joystick", "encoder", "reasoning", "keycap", "usage", "rate-limit-reset"
+  ]);
+  const second = await messages.next();
+  assert.equal(second.type, "snapshot");
+  socket.send(JSON.stringify({
+    type: "command", protocol: RELAY_PROTOCOL_VERSION, requestId: "request-1",
+    command: { kind: "agent", slot: 2, threadKey: "00000000-0000-4000-8000-000000000002", act: 1 }
+  }));
+  const result = await messages.next();
+  assert.deepEqual(calls, [["agent", 2, 1]]);
+  assert.equal(result.type, "result");
+  assert.equal(result.ok, true);
+  socket.close();
+  await server.close();
+});
+
+test("running relay publishes refreshed Codex metadata without changing host identity", async () => {
+  const port = await freePort();
+  const control = {
+    refresh: async () => snapshot,
+    sendAgent: async () => {}, sendAction: async () => {}, sendJoystick: async () => {},
+    sendEncoder: async () => {}, adjustReasoning: async () => {}, runKeycap: async () => {}, consumeRateLimitReset: async () => {}
+  };
+  const server = new CodexRelayServer(
+    { enabled: true, listenHost: "127.0.0.1", port, token: "t".repeat(32) },
+    { ...host, codexVersion: "old" }, control, () => {}
+  );
+  await server.start();
+  server.updateHost({ ...host, hostName: "Renamed Mac", codexVersion: "new" });
+  assert.throws(
+    () => server.updateHost({ ...host, hostId: "56fd97ad-7073-42cc-85ce-befa17546d7d" }),
+    /identity cannot change/
+  );
+  const socket = new WebSocket(`ws://127.0.0.1:${port}`);
+  const messages = messageQueue(socket);
+  await onceOpen(socket);
+  socket.send(JSON.stringify({ type: "auth", protocol: RELAY_PROTOCOL_VERSION, token: "t".repeat(32) }));
+  const ready = await messages.next();
+  const readyHost = ready.host as CodexHost;
+  assert.equal(readyHost.hostName, "Renamed Mac");
+  assert.equal(readyHost.codexVersion, "new");
+  const published = await messages.next();
+  assert.equal((published.host as CodexHost).codexVersion, "new");
+  socket.close();
+  await server.close();
+});
+
+test("relay rejects a client with the wrong token before publishing state", async () => {
+  const port = await freePort();
+  let refreshes = 0;
+  const control = {
+    refresh: async () => { refreshes += 1; return snapshot; },
+    sendAgent: async () => {}, sendAction: async () => {}, sendJoystick: async () => {},
+    sendEncoder: async () => {}, adjustReasoning: async () => {}, runKeycap: async () => {}, consumeRateLimitReset: async () => {}
+  };
+  const server = new CodexRelayServer(
+    { enabled: true, listenHost: "127.0.0.1", port, token: "t".repeat(32) }, host, control, () => {}
+  );
+  await server.start();
+  const socket = new WebSocket(`ws://127.0.0.1:${port}`);
+  await onceOpen(socket);
+  socket.send(JSON.stringify({ type: "auth", protocol: RELAY_PROTOCOL_VERSION, token: "wrong-token".repeat(4) }));
+  const closeCode = await new Promise<number>((resolve) => socket.once("close", resolve));
+  assert.equal(closeCode, 4003);
+  assert.equal(refreshes, 0);
+  await server.close();
+});
+
+test("authenticated relay survives an unavailable Codex snapshot", async () => {
+  const port = await freePort();
+  const logs: string[] = [];
+  const control = {
+    refresh: async (): Promise<MicroSnapshot> => { throw new Error("bridge offline"); },
+    sendAgent: async () => {}, sendAction: async () => {}, sendJoystick: async () => {},
+    sendEncoder: async () => {}, adjustReasoning: async () => {}, runKeycap: async () => {}, consumeRateLimitReset: async () => {}
+  };
+  const server = new CodexRelayServer(
+    { enabled: true, listenHost: "127.0.0.1", port, token: "t".repeat(32) }, host, control,
+    (message) => logs.push(message)
+  );
+  await server.start();
+  const socket = new WebSocket(`ws://127.0.0.1:${port}`);
+  const messages = messageQueue(socket);
+  await onceOpen(socket);
+  socket.send(JSON.stringify({ type: "auth", protocol: RELAY_PROTOCOL_VERSION, token: "t".repeat(32) }));
+  assert.equal((await messages.next()).type, "ready");
+  const health = await messages.next();
+  assert.equal(health.type, "health");
+  assert.equal(health.state, "degraded");
+  assert.equal(health.reason, "native-signals-unavailable");
+  assert.equal(socket.readyState, WebSocket.OPEN);
+  assert.equal(logs.filter((message) => message.includes("bridge offline")).length, 1);
+  socket.close();
+  await server.close();
+});
+
+test("relay client preserves last-known tasks but marks their host offline after disconnect", async () => {
+  const port = await freePort();
+  const control = {
+    refresh: async () => snapshot,
+    sendAgent: async () => {}, sendAction: async () => {}, sendJoystick: async () => {},
+    sendEncoder: async () => {}, adjustReasoning: async () => {}, runKeycap: async () => {}, consumeRateLimitReset: async () => {}
+  };
+  const server = new CodexRelayServer(
+    { enabled: true, listenHost: "127.0.0.1", port, token: "t".repeat(32) }, host, control, () => {}
+  );
+  await server.start();
+  const deliveredSnapshots: HostSnapshot[] = [];
+  const client = new CodexRelayClient(
+    { enabled: true, url: `ws://127.0.0.1:${port}`, token: "t".repeat(32) },
+    (value) => deliveredSnapshots.push(value), () => {}
+  );
+  client.start();
+  await waitUntil(() => client.currentHealth().state === "ready");
+  assert.equal(deliveredSnapshots.length, 1);
+  const lastKnown = client.currentSnapshot();
+  assert.equal(lastKnown?.snapshot.slots[0]?.title, "Task 1");
+  await server.close();
+  await waitUntil(() => client.currentHealth().state === "offline");
+  assert.equal(deliveredSnapshots.length, 1, "health-only transitions must not call the snapshot callback");
+  assert.equal(client.currentSnapshot(), lastKnown);
+  assert.equal(client.isConnected(), false);
+  client.close();
+});
+
+async function freePort(): Promise<number> {
+  const server = createServer();
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  const port = typeof address === "object" && address ? address.port : 0;
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+  return port;
+}
+
+async function onceOpen(socket: WebSocket): Promise<void> {
+  if (socket.readyState === WebSocket.OPEN) return;
+  await new Promise<void>((resolve, reject) => {
+    socket.once("open", resolve);
+    socket.once("error", reject);
+  });
+}
+
+async function waitUntil(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error("Timed out waiting for relay state.");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+function messageQueue(socket: WebSocket): { next: () => Promise<Record<string, unknown>> } {
+  const queued: Record<string, unknown>[] = [];
+  const waiting: Array<(value: Record<string, unknown>) => void> = [];
+  socket.on("message", (raw) => {
+    const value = JSON.parse(raw.toString()) as Record<string, unknown>;
+    const resolve = waiting.shift();
+    if (resolve) resolve(value);
+    else queued.push(value);
+  });
+  return {
+    next: () => {
+      const value = queued.shift();
+      if (value) return Promise.resolve(value);
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("Timed out waiting for relay message.")), 2_000);
+        waiting.push((message) => { clearTimeout(timer); resolve(message); });
+      });
+    }
+  };
+}

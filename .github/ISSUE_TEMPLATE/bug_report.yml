@@ -1,0 +1,47 @@
+name: Bug report
+description: Report a reproducible Codex Micro Mobile or bridge problem
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not attach Codex databases, rollout files, authentication data, or official SVG assets.
+  - type: input
+    id: codex-version
+    attributes:
+      label: Codex app version
+      placeholder: 26.707.12708.0
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected component
+      options:
+        - iPhone app
+        - macOS bridge
+        - Windows bridge
+        - Stream Deck plugin
+        - Pairing or networking
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Include iOS, macOS or Windows version and device model where relevant.
+      placeholder: iOS 26.4, iPhone 17 Pro; macOS 26.4
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Include the exact action and expected/actual behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Non-sensitive log excerpt
+      render: text
